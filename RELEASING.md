@@ -19,8 +19,7 @@ This project publishes to npm as `codex-switcher-11arkan`.
    - `npm install`
    - `npm run release:check`
 4. Commit and push to `main`.
-5. Run `.github/workflows/publish.yml` manually from Actions.
-6. In workflow input, type `publish` exactly to confirm release.
+5. The publish workflow runs automatically and publishes if the version is new.
 
 ## Manual fallback
 

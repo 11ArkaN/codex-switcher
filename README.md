@@ -125,7 +125,7 @@ npm run release:check
 ## CI and release automation
 
 - CI runs on every push/PR via `.github/workflows/ci.yml`.
-- npm publish workflow exists at `.github/workflows/publish.yml`, uses `NPM_TOKEN`, and requires manual confirmation input (`publish`).
+- npm publish runs automatically on push to `main` when `package.json` version is unpublished. Requires `NPM_TOKEN` secret.
 
 ## Contributing and policies
 
