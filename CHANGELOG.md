@@ -6,11 +6,17 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ## [Unreleased]
 
-### Initial release
+## [2.1.0] - 2026-03-01
+
+### Added
 
 - Public release scaffolding for GitHub: CI, issue templates, PR template, contributing guide, code of conduct, and security policy.
 - Usage views for per-model, per-day, and per-month token cost reporting.
 - Runtime pricing fetch from OpenAI pricing docs with in-memory cache and fallback behavior.
+
+### Fixed
+
+- Corrected GitHub repository URLs in package.json and README badges to match actual account.
 
 ## [2.0.0] - 2026-03-01
 
