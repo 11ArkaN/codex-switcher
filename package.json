@@ -1,0 +1,56 @@
+{
+  "name": "codex-switcher-11arkan",
+  "version": "2.0.0",
+  "description": "Interactive React + Ink CLI for running codex with isolated CODEX_HOME profiles.",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/index.tsx",
+    "start": "node dist/index.js",
+    "release:check": "npm run build && npm pack --dry-run",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"No tests configured\""
+  },
+  "keywords": [
+    "codex",
+    "cli",
+    "ink",
+    "react",
+    "account-switcher",
+    "developer-tools"
+  ],
+  "author": "11ArkaN",
+  "license": "ISC",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/11ArkaN/codex-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/11ArkaN/codex-switcher/issues"
+  },
+  "homepage": "https://github.com/11ArkaN/codex-switcher#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "codex-switcher": "dist/index.js"
+  },
+  "dependencies": {
+    "ink": "^6.8.0",
+    "meow": "^14.1.0",
+    "react": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/react": "^19.2.14",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
