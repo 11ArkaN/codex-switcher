@@ -598,14 +598,33 @@ class CodexService {
         }
 
         try {
-            const response = await fetch(PRICING_URL);
-            if (!response.ok) {
-                this.pricingCache = new Map();
-                this.pricingCacheExpiresAt = now + PRICING_FAILURE_CACHE_TTL_MS;
-                return this.pricingCache;
+            let html: string | null = null;
+            const maxAttempts = 3;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                    const response = await fetch(PRICING_URL);
+                    if (!response.ok) {
+                        throw new CodexSwitcherError(`Pricing request failed with status ${response.status}.`);
+                    }
+
+                    html = await response.text();
+                    break;
+                } catch {
+                    if (attempt >= maxAttempts) {
+                        throw new CodexSwitcherError("Pricing request failed after retries.");
+                    }
+
+                    await new Promise((resolve) => {
+                        setTimeout(resolve, 500 * attempt);
+                    });
+                }
             }
 
-            const html = await response.text();
+            if (!html) {
+                throw new CodexSwitcherError("Pricing request returned empty response.");
+            }
+
             const parsed = parsePricingFromHtml(html);
             this.pricingCache = parsed;
             this.pricingCacheExpiresAt = now + (parsed.size > 0 ? PRICING_CACHE_TTL_MS : PRICING_FAILURE_CACHE_TTL_MS);
@@ -1013,7 +1032,12 @@ function isZeroSnapshot(value: TokenSnapshot): boolean {
 }
 
 function normalizeModelId(model: string): string {
-    const trimmed = model.trim().toLowerCase();
+    const cleaned = decodeHtmlEntities(model)
+        .replace(/<[^>]*>/g, "")
+        .replace(/\s*\([^)]*\)\s*$/g, "")
+        .trim()
+        .toLowerCase();
+    const trimmed = cleaned;
     if (trimmed.includes("/")) {
         const parts = trimmed.split("/").filter((item) => item.length > 0);
         if (parts.length > 0) {
@@ -1026,17 +1050,9 @@ function normalizeModelId(model: string): string {
 
 function parsePricingFromHtml(html: string): Map<string, ModelPricing> {
     const pricing = new Map<string, ModelPricing>();
-
-    const lower = html.toLowerCase();
-    const textSectionStart = lower.indexOf("text tokens");
-    const textSectionEnd = textSectionStart >= 0 ? lower.indexOf("image tokens", textSectionStart) : -1;
-    const target = textSectionStart >= 0
-        ? html.slice(textSectionStart, textSectionEnd > textSectionStart ? textSectionEnd : undefined)
-        : html;
-
-    const rowRegex = /<tr>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]+)<\/td>/gi;
+    const rowRegex = /<tr[^>]*>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/gi;
     let match: RegExpExecArray | null;
-    while ((match = rowRegex.exec(target)) !== null) {
+    while ((match = rowRegex.exec(html)) !== null) {
         const model = normalizeModelId(match[1] ?? "");
         if (model.length === 0) {
             continue;
@@ -1067,8 +1083,21 @@ function parseDollarValue(raw: string | undefined): number | null {
     }
 
     const cleaned = raw.replace(/<[^>]*>/g, "").replace(/\$/g, "").replace(/,/g, "").trim();
+    if (!/^\d+(\.\d+)?$/.test(cleaned)) {
+        return null;
+    }
+
     const value = Number.parseFloat(cleaned);
     return Number.isFinite(value) ? value : null;
+}
+
+function decodeHtmlEntities(value: string): string {
+    return value
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&amp;/gi, "&")
+        .replace(/&#39;/gi, "'")
+        .replace(/&quot;/gi, '"');
 }
 
 function parseDollarValueOrNull(raw: string | undefined): number | null {
@@ -1086,15 +1115,20 @@ function parseDollarValueOrNull(raw: string | undefined): number | null {
 
 function resolveModelPricing(model: string, pricingMap: Map<string, ModelPricing>): ModelPricing | null {
     const normalized = normalizeModelId(model);
-    const direct = pricingMap.get(normalized);
-    if (direct) {
-        return direct;
-    }
+    const candidates = new Set<string>([normalized]);
 
     if (normalized.endsWith("-latest")) {
-        const fallback = pricingMap.get(normalized.replace(/-latest$/, ""));
-        if (fallback) {
-            return fallback;
+        candidates.add(normalized.replace(/-latest$/, ""));
+    }
+
+    if (/\-\d{4}\-\d{2}\-\d{2}$/.test(normalized)) {
+        candidates.add(normalized.replace(/\-\d{4}\-\d{2}\-\d{2}$/, ""));
+    }
+
+    for (const candidate of candidates) {
+        const resolved = pricingMap.get(candidate);
+        if (resolved) {
+            return resolved;
         }
     }
 
