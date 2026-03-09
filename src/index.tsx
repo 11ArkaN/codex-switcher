@@ -85,7 +85,18 @@ type ProfileFileModel = {
     profiles: CodexProfile[];
 };
 
+type MainProfileSwitchResult = {
+    targetName: string;
+    mainHome: string;
+    targetHome: string;
+    defaultCodexHomeScope: "user" | "process";
+    defaultCodexHomeChanged: boolean;
+    defaultCodexHomeWarning?: string;
+};
+
 class CodexSwitcherError extends Error { }
+
+const AUTH_STATE_FILES = ["auth.json", "cap_sid"] as const;
 
 class ProfileStore {
     private readonly storeDirectory: string;
@@ -311,6 +322,105 @@ class CodexService {
 
     async showProfile(name: string): Promise<CodexProfile> {
         return this.store.getProfile(name);
+    }
+
+    async switchMainProfile(targetName: string): Promise<MainProfileSwitchResult> {
+        if (!targetName || targetName.trim().length === 0) {
+            throw new CodexSwitcherError("Target profile name cannot be empty.");
+        }
+
+        if (targetName.toLowerCase() === "main") {
+            throw new CodexSwitcherError("Target profile must be different from 'main'.");
+        }
+
+        const mainProfile = await this.store.getProfile("main");
+        const targetProfile = await this.store.getProfile(targetName);
+        await this.store.ensureProfileDirectory(mainProfile.homeDirectory);
+        await this.store.ensureProfileDirectory(targetProfile.homeDirectory);
+        await this.swapAuthStateBetweenHomes(mainProfile.homeDirectory, targetProfile.homeDirectory);
+
+        const codexHomeSync = await this.syncDefaultCodexHome(mainProfile.homeDirectory);
+        return {
+            targetName: targetProfile.name,
+            mainHome: mainProfile.homeDirectory,
+            targetHome: targetProfile.homeDirectory,
+            defaultCodexHomeScope: codexHomeSync.scope,
+            defaultCodexHomeChanged: codexHomeSync.changed,
+            defaultCodexHomeWarning: codexHomeSync.warning,
+        };
+    }
+
+    private async swapAuthStateBetweenHomes(mainHome: string, targetHome: string): Promise<void> {
+        const mainState = new Map<string, Buffer | null>();
+        const targetState = new Map<string, Buffer | null>();
+
+        for (const fileName of AUTH_STATE_FILES) {
+            mainState.set(fileName, await this.readOptionalFile(path.join(mainHome, fileName)));
+            targetState.set(fileName, await this.readOptionalFile(path.join(targetHome, fileName)));
+        }
+
+        try {
+            await this.writeAuthState(mainHome, targetState);
+            await this.writeAuthState(targetHome, mainState);
+        } catch (error) {
+            await this.writeAuthState(mainHome, mainState).catch(() => undefined);
+            await this.writeAuthState(targetHome, targetState).catch(() => undefined);
+            const message = error instanceof Error ? error.message : "Unknown file operation error.";
+            throw new CodexSwitcherError(`Failed to switch account state: ${message}`);
+        }
+    }
+
+    private async writeAuthState(homeDirectory: string, state: Map<string, Buffer | null>): Promise<void> {
+        for (const fileName of AUTH_STATE_FILES) {
+            const fullPath = path.join(homeDirectory, fileName);
+            const content = state.get(fileName) ?? null;
+            if (content === null) {
+                await fs.rm(fullPath, { force: true });
+                continue;
+            }
+
+            await fs.writeFile(fullPath, content);
+        }
+    }
+
+    private async readOptionalFile(filePath: string): Promise<Buffer | null> {
+        try {
+            return await fs.readFile(filePath);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") {
+                return null;
+            }
+
+            throw error;
+        }
+    }
+
+    private async syncDefaultCodexHome(codexHome: string): Promise<{ scope: "user" | "process"; changed: boolean; warning?: string }> {
+        process.env.CODEX_HOME = codexHome;
+
+        if (process.platform !== "win32") {
+            return { scope: "process", changed: true };
+        }
+
+        try {
+            const currentUserValue = await UserEnvironmentManager.getUserVariable("CODEX_HOME");
+            const currentNormalized = currentUserValue.trim().length > 0 ? normalizePath(currentUserValue) : "";
+            const nextNormalized = normalizePath(codexHome);
+            if (currentNormalized === nextNormalized) {
+                return { scope: "user", changed: false };
+            }
+
+            await UserEnvironmentManager.setUserVariable("CODEX_HOME", codexHome);
+            return { scope: "user", changed: true };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown failure while updating user CODEX_HOME.";
+            return {
+                scope: "process",
+                changed: true,
+                warning: `Switched profiles, but failed to persist user CODEX_HOME: ${message}`,
+            };
+        }
     }
 
     async loginProfile(name: string, mode: LaunchMode = "inline"): Promise<number> {
@@ -872,6 +982,30 @@ class UserPathManager {
     }
 }
 
+class UserEnvironmentManager {
+    static async getUserVariable(name: string): Promise<string> {
+        this.ensureWindows();
+        const escapedName = escapePowerShellString(name);
+        const script = `[Environment]::GetEnvironmentVariable('${escapedName}','User')`;
+        const output = await runPowerShell(script);
+        return output.trim();
+    }
+
+    static async setUserVariable(name: string, value: string): Promise<void> {
+        this.ensureWindows();
+        const escapedName = escapePowerShellString(name);
+        const escapedValue = escapePowerShellString(value);
+        const script = `[Environment]::SetEnvironmentVariable('${escapedName}','${escapedValue}','User')`;
+        await runPowerShell(script);
+    }
+
+    private static ensureWindows(): void {
+        if (process.platform !== "win32") {
+            throw new CodexSwitcherError("User environment variable updates are currently supported on Windows only.");
+        }
+    }
+}
+
 function normalizePath(value: string): string {
     const expanded = value.replace(/%([^%]+)%/g, (_, name: string) => process.env[name] ?? `%${name}%`);
 
@@ -880,6 +1014,10 @@ function normalizePath(value: string): string {
     } catch {
         return expanded.replace(/[\\/]+$/, "").toLowerCase();
     }
+}
+
+function escapePowerShellString(value: string): string {
+    return value.replace(/'/g, "''");
 }
 
 function runPowerShell(script: string): Promise<string> {
@@ -1394,6 +1532,7 @@ function printHelp(): void {
     console.log("  login <profile> [--new-window]            Run 'codex login' in profile");
     console.log("  run <profile> [--new-window] [--yolo] [-- args]  Run codex with profile context");
     console.log("  spawn <profile> [--yolo] [-- args]        Open codex in new window");
+    console.log("  switch-main <profile>                     Swap account auth with target, keep main threads/settings");
     console.log("  status                                    List login status for all profiles");
     console.log("  usage [profile] [--period <model|day|month>]  Show usage and estimated API cost");
     console.log("  path add                                  Add launcher directory to user PATH");
@@ -1534,6 +1673,27 @@ async function executeCommand(service: CodexService, args: string[]): Promise<nu
             const exitCode = await service.loginProfile(args[1], mode);
             return exitCode;
         }
+        case "switch-main": {
+            if (args.length !== 2) {
+                throw new CodexSwitcherError("Usage: switch-main <profile>");
+            }
+
+            const switched = await service.switchMainProfile(args[1]);
+            console.log(`Switched main account using '${switched.targetName}'.`);
+            console.log(`main home (unchanged): ${switched.mainHome}`);
+            console.log(`${switched.targetName} home (unchanged): ${switched.targetHome}`);
+            console.log(`Swapped auth files: ${AUTH_STATE_FILES.join(", ")}`);
+            if (switched.defaultCodexHomeWarning) {
+                console.log(`Warning: ${switched.defaultCodexHomeWarning}`);
+            } else if (switched.defaultCodexHomeScope === "user") {
+                console.log(switched.defaultCodexHomeChanged
+                    ? "Updated user CODEX_HOME. Open a new terminal before running plain 'codex'."
+                    : "User CODEX_HOME already matched main profile. Open a new terminal if current shell is stale.");
+            } else {
+                console.log("Updated CODEX_HOME for this process only.");
+            }
+            return 0;
+        }
         case "spawn":
         case "open": {
             if (args.length < 2) {
@@ -1615,6 +1775,7 @@ type MenuAction =
     | "login"
     | "open"
     | "open-yolo"
+    | "switch-main"
     | "status"
     | "usage"
     | "path"
@@ -1630,6 +1791,7 @@ const MENU_ITEMS: MenuItem[] = [
     { id: "login", label: "Login profile (new window)" },
     { id: "open", label: "Open profile session (new window)" },
     { id: "open-yolo", label: "Open profile session (new window, --yolo)" },
+    { id: "switch-main", label: "Switch main profile account" },
     { id: "status", label: "Check status (all profiles)" },
     { id: "usage", label: "Show usage by model (all profiles)" },
     { id: "path", label: "Add codex-switcher to PATH" },
@@ -1773,6 +1935,7 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
                     "Use arrow keys + Enter.",
                     "Create profile uses typed input; other profile actions use selectors.",
                     "Use the --yolo menu entry to launch a profile directly in yolo mode.",
+                    "Switch main account swaps auth only; main threads/settings stay in main home.",
                     "Usage menu includes model/day/month cost views.",
                     "No-arg mode is interactive; command mode still works.",
                     "Press any key to return.",
@@ -1803,6 +1966,11 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
 
         if (action === "remove") {
             await openProfileSelector(action, "Select profile to remove");
+            return;
+        }
+
+        if (action === "switch-main") {
+            await openProfileSelector(action, "Select profile to swap with main");
             return;
         }
 
@@ -1871,10 +2039,19 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
         }
     }
 
-    async function openProfileSelector(action: Extract<MenuAction, "login" | "open" | "open-yolo" | "remove">, title: string): Promise<void> {
+    async function openProfileSelector(action: Extract<MenuAction, "login" | "open" | "open-yolo" | "remove" | "switch-main">, title: string): Promise<void> {
         const profiles = await props.service.listProfiles();
         if (profiles.length === 0) {
             setViewState({ mode: "message", lines: ["No profiles found.", "Press any key to return."] });
+            return;
+        }
+
+        const options = action === "switch-main"
+            ? profiles.filter((item) => item.name.toLowerCase() !== "main").map((item) => item.name)
+            : profiles.map((item) => item.name);
+
+        if (options.length === 0) {
+            setViewState({ mode: "message", lines: ["No swappable profiles found.", "Press any key to return."] });
             return;
         }
 
@@ -1882,7 +2059,7 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
             mode: "select",
             action,
             title,
-            options: profiles.map((item) => item.name),
+            options,
             selectedIndex: 0,
         });
     }
@@ -1957,6 +2134,29 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
                 setViewState({
                     mode: "message",
                     lines: [`Removed profile '${selectedOption}'.`, "Press any key to return."],
+                });
+                return;
+            }
+
+            if (action === "switch-main") {
+                const switched = await props.service.switchMainProfile(selectedOption);
+                const syncLine = switched.defaultCodexHomeWarning
+                    ? `Warning: ${switched.defaultCodexHomeWarning}`
+                    : switched.defaultCodexHomeScope === "user"
+                        ? (switched.defaultCodexHomeChanged
+                            ? "Updated user CODEX_HOME. Open a new terminal for plain 'codex'."
+                            : "User CODEX_HOME already matched main profile. Open a new terminal if needed.")
+                        : "Updated CODEX_HOME for this process only.";
+                setViewState({
+                    mode: "message",
+                    lines: [
+                        `Switched main account using '${switched.targetName}'.`,
+                        `main home (unchanged): ${switched.mainHome}`,
+                        `${switched.targetName} home (unchanged): ${switched.targetHome}`,
+                        `Swapped auth files: ${AUTH_STATE_FILES.join(", ")}`,
+                        syncLine,
+                        "Press any key to return.",
+                    ],
                 });
                 return;
             }

@@ -6,6 +6,16 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ## [Unreleased]
 
+### Added
+
+- New `switch-main <profile>` command to switch the account used by `main` through profile-based auth swapping.
+- Interactive menu action to switch the `main` profile account using the same swap behavior.
+
+### Fixed
+
+- `switch-main` now also updates user `CODEX_HOME` on Windows, so running plain `codex` in a new terminal follows the selected `main` account.
+- `switch-main` now preserves `main` threads/settings by swapping auth artifacts (`auth.json`, `cap_sid`) instead of swapping whole profile home directories.
+
 ## [2.1.1] - 2026-03-05
 
 ### Fixed

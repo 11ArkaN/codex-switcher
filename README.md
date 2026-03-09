@@ -70,6 +70,10 @@ node dist/index.js run work
 node dist/index.js run work --new-window
 node dist/index.js spawn personal -- chat
 
+# switch account used by main while keeping main threads/settings in place
+# (swaps auth artifacts with target profile and updates user CODEX_HOME)
+node dist/index.js switch-main work
+
 # login status for all profiles in one list
 node dist/index.js status
 
@@ -143,4 +147,6 @@ npm run release:check
 - Pricing is cached locally in-memory (success: 6h, fetch failure: 5m retry window).
 - If a model is missing from the local pricing map, its row is still shown but cost is `n/a`.
 - In interactive mode, profile creation uses typing; login/open/remove now use selectable profile lists.
+- `switch-main <profile>` keeps `main` home fixed and swaps auth artifacts (`auth.json`, `cap_sid`) between `main` and target profile, so `main` threads/settings remain in place.
+- After `switch-main`, user `CODEX_HOME` is updated on Windows so plain `codex` follows `main` in new terminals.
 - In interactive mode, `Usage` opens a submenu with model view, daily cost view, and monthly cost view.
