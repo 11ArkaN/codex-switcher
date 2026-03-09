@@ -1,6 +1,6 @@
 {
   "name": "codex-switcher-11arkan",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Interactive React + Ink CLI for running codex with isolated CODEX_HOME profiles.",
   "main": "dist/index.js",
   "files": [
