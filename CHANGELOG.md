@@ -6,6 +6,13 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-03-16
+
+### Changed
+
+- Updated GitHub Actions workflows to use `actions/checkout@v6` and `actions/setup-node@v6`.
+- Bumped `@types/node` to `25.5.0`.
+
 ## [2.1.3] - 2026-03-16
 
 ### Added
