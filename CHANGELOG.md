@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-03-16
+
 ### Added
 
 - New `switch-main <profile>` command to switch the account used by `main` through profile-based auth swapping.
@@ -13,8 +15,13 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ### Fixed
 
+- Fixed pricing extraction to read the current official OpenAI pricing payload, restoring cost totals for current GPT-5 Codex models such as `gpt-5.3-codex`, `gpt-5.1-codex`, and `gpt-5-codex`.
 - `switch-main` now also updates user `CODEX_HOME` on Windows, so running plain `codex` in a new terminal follows the selected `main` account.
 - `switch-main` now preserves `main` threads/settings by swapping auth artifacts (`auth.json`, `cap_sid`) instead of swapping whole profile home directories.
+
+### Removed
+
+- Removed the `path` command and the interactive "Add codex-switcher to PATH" menu option.
 
 ## [2.1.1] - 2026-03-05
 

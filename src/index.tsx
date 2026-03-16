@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import React, { useMemo, useState } from "react";
 import { Box, render, Text, useApp, useInput } from "ink";
@@ -473,29 +472,6 @@ class CodexService {
         );
     }
 
-    async pathAdd(): Promise<{ status: "added" | "already"; directory: string; launcherPath: string }> {
-        const launcherPath = await this.ensureUserLauncherScript();
-        const directory = path.dirname(launcherPath);
-        const updateResult = await UserPathManager.addDirectory(directory);
-        return {
-            status: updateResult,
-            directory,
-            launcherPath,
-        };
-    }
-
-    async pathStatus(): Promise<{ present: boolean; directory: string; launcherPath: string; launcherExists: boolean }> {
-        const launcherPath = this.getUserLauncherPath();
-        const directory = path.dirname(launcherPath);
-        const present = await UserPathManager.isDirectoryOnUserPath(directory);
-        return {
-            present,
-            directory,
-            launcherPath,
-            launcherExists: existsSync(launcherPath),
-        };
-    }
-
     private async readUsageForHome(codexHome: string): Promise<Omit<ProfileUsage, "profile">> {
         const sessionUsage = await this.readUsageFromSessions(codexHome);
         if (sessionUsage) {
@@ -865,121 +841,6 @@ class CodexService {
         child.unref();
         return 0;
     }
-
-    private resolveProjectRoot(): string {
-        const currentFile = fileURLToPath(import.meta.url);
-        const currentDir = path.dirname(currentFile);
-        return path.resolve(currentDir, "..");
-    }
-
-    private getUserLauncherDirectory(): string {
-        if (process.platform !== "win32") {
-            return path.join(os.homedir(), ".local", "bin");
-        }
-
-        const appData = process.env.APPDATA;
-        const base = appData && appData.trim().length > 0 ? appData : path.join(os.homedir(), "AppData", "Roaming");
-        return path.join(base, "CodexSwitcher", "bin");
-    }
-
-    private getUserLauncherPath(): string {
-        if (process.platform === "win32") {
-            return path.join(this.getUserLauncherDirectory(), "codex-switcher.cmd");
-        }
-
-        return path.join(this.getUserLauncherDirectory(), "codex-switcher");
-    }
-
-    private resolveEntryScriptPath(): string {
-        return path.join(this.resolveProjectRoot(), "dist", "index.js");
-    }
-
-    private async ensureUserLauncherScript(): Promise<string> {
-        if (process.platform !== "win32") {
-            throw new CodexSwitcherError("PATH auto-add is currently supported on Windows only.");
-        }
-
-        const entryScript = this.resolveEntryScriptPath();
-        if (!existsSync(entryScript)) {
-            throw new CodexSwitcherError("Build output not found. Run 'npm run build' first.");
-        }
-
-        const launcherPath = this.getUserLauncherPath();
-        const launcherDir = path.dirname(launcherPath);
-        await fs.mkdir(launcherDir, { recursive: true });
-
-        const content = [
-            "@echo off",
-            "setlocal",
-            `node "${entryScript}" %*`,
-            "",
-        ].join("\r\n");
-
-        await fs.writeFile(launcherPath, content, "utf8");
-        return launcherPath;
-    }
-}
-
-type PathUpdateResult = "added" | "already";
-
-class UserPathManager {
-    static async isDirectoryOnUserPath(directory: string): Promise<boolean> {
-        this.ensureWindows();
-
-        const normalized = normalizePath(directory);
-        const entries = await this.getUserPathEntries();
-        return entries.some((entry) => normalizePath(entry) === normalized);
-    }
-
-    static async addDirectory(directory: string): Promise<PathUpdateResult> {
-        this.ensureWindows();
-
-        const normalized = normalizePath(directory);
-        const entries = await this.getUserPathEntries();
-        const alreadyPresent = entries.some((entry) => normalizePath(entry) === normalized);
-        if (alreadyPresent) {
-            return "already";
-        }
-
-        const updatedEntries = [...entries, normalized];
-        const updatedPath = updatedEntries.join(";");
-
-        await this.setUserPath(updatedPath);
-
-        const processPath = process.env.PATH ?? "";
-        const processEntries = processPath.split(";").filter((item) => item.trim().length > 0);
-        if (!processEntries.some((entry) => normalizePath(entry) === normalized)) {
-            process.env.PATH = processPath ? `${processPath};${normalized}` : normalized;
-        }
-
-        return "added";
-    }
-
-    private static ensureWindows(): void {
-        if (process.platform !== "win32") {
-            throw new CodexSwitcherError("PATH auto-update is currently supported on Windows only.");
-        }
-    }
-
-    private static async getUserPathEntries(): Promise<string[]> {
-        const userPath = await this.getUserPath();
-        return userPath
-            .split(";")
-            .map((item) => item.trim())
-            .filter((item) => item.length > 0);
-    }
-
-    private static async getUserPath(): Promise<string> {
-        const script = "[Environment]::GetEnvironmentVariable('Path','User')";
-        const output = await runPowerShell(script);
-        return output.trim();
-    }
-
-    private static async setUserPath(value: string): Promise<void> {
-        const escaped = value.replace(/'/g, "''");
-        const script = `[Environment]::SetEnvironmentVariable('Path','${escaped}','User')`;
-        await runPowerShell(script);
-    }
 }
 
 class UserEnvironmentManager {
@@ -1187,7 +1048,7 @@ function normalizeModelId(model: string): string {
 }
 
 function parsePricingFromHtml(html: string): Map<string, ModelPricing> {
-    const pricing = new Map<string, ModelPricing>();
+    const pricing = parsePricingFromAstroProps(html);
     const rowRegex = /<tr[^>]*>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/gi;
     let match: RegExpExecArray | null;
     while ((match = rowRegex.exec(html)) !== null) {
@@ -1203,16 +1064,70 @@ function parsePricingFromHtml(html: string): Map<string, ModelPricing> {
             continue;
         }
 
-        if (!pricing.has(model)) {
-            pricing.set(model, {
-                inputPer1M,
-                cachedInputPer1M,
-                outputPer1M,
-            });
+        setPricingIfMissing(pricing, model, inputPer1M, cachedInputPer1M, outputPer1M);
+    }
+
+    return pricing;
+}
+
+function parsePricingFromAstroProps(html: string): Map<string, ModelPricing> {
+    const pricing = new Map<string, ModelPricing>();
+    const propsRegex = /component-export="TextTokenPricingTables"[^>]*props="([^"]+)"/g;
+
+    for (const match of html.matchAll(propsRegex)) {
+        const decodedProps = decodeHtmlEntities(match[1] ?? "");
+        if (decodedProps.length === 0) {
+            continue;
+        }
+
+        let rawProps: unknown;
+        try {
+            rawProps = JSON.parse(decodedProps);
+        } catch {
+            continue;
+        }
+
+        const props = reviveAstroSerializedValue(rawProps) as { tier?: unknown; rows?: unknown };
+        if (props.tier !== "standard" || !Array.isArray(props.rows)) {
+            continue;
+        }
+
+        for (const row of props.rows) {
+            if (!Array.isArray(row) || row.length < 4) {
+                continue;
+            }
+
+            const model = normalizeModelId(String(row[0] ?? ""));
+            const inputPer1M = toFiniteNumber(row[1]);
+            const cachedInputPer1M = toFiniteNumber(row[2]);
+            const outputPer1M = toFiniteNumber(row[3]);
+            if (model.length === 0 || inputPer1M === null || outputPer1M === null) {
+                continue;
+            }
+
+            setPricingIfMissing(pricing, model, inputPer1M, cachedInputPer1M, outputPer1M);
         }
     }
 
     return pricing;
+}
+
+function setPricingIfMissing(
+    pricing: Map<string, ModelPricing>,
+    model: string,
+    inputPer1M: number,
+    cachedInputPer1M: number | null,
+    outputPer1M: number,
+): void {
+    if (pricing.has(model)) {
+        return;
+    }
+
+    pricing.set(model, {
+        inputPer1M,
+        cachedInputPer1M,
+        outputPer1M,
+    });
 }
 
 function parseDollarValue(raw: string | undefined): number | null {
@@ -1236,6 +1151,36 @@ function decodeHtmlEntities(value: string): string {
         .replace(/&amp;/gi, "&")
         .replace(/&#39;/gi, "'")
         .replace(/&quot;/gi, '"');
+}
+
+function reviveAstroSerializedValue(value: unknown): unknown {
+    return reviveAstroNode([0, value]);
+}
+
+function reviveAstroNode(value: unknown): unknown {
+    if (!Array.isArray(value) || value.length !== 2) {
+        return value;
+    }
+
+    const [kind, payload] = value;
+    switch (kind) {
+        case 0:
+            if (typeof payload !== "object" || payload === null) {
+                return payload;
+            }
+
+            return Object.fromEntries(
+                Object.entries(payload).map(([key, entry]) => [key, reviveAstroNode(entry)]),
+            );
+        case 1:
+            return Array.isArray(payload) ? payload.map((entry) => reviveAstroNode(entry)) : [];
+        default:
+            return payload;
+    }
+}
+
+function toFiniteNumber(value: unknown): number | null {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function parseDollarValueOrNull(raw: string | undefined): number | null {
@@ -1535,8 +1480,6 @@ function printHelp(): void {
     console.log("  switch-main <profile>                     Swap account auth with target, keep main threads/settings");
     console.log("  status                                    List login status for all profiles");
     console.log("  usage [profile] [--period <model|day|month>]  Show usage and estimated API cost");
-    console.log("  path add                                  Add launcher directory to user PATH");
-    console.log("  path status                               Show PATH status");
     console.log("  help                                      Show this help");
 }
 
@@ -1738,32 +1681,6 @@ async function executeCommand(service: CodexService, args: string[]): Promise<nu
 
             return service.runProfile(profileName, codexArgs, mode);
         }
-        case "path": {
-            const sub = args[1]?.toLowerCase();
-            if (sub === "add") {
-                const result = await service.pathAdd();
-                if (result.status === "already") {
-                    console.log("codex-switcher launcher directory is already in user PATH.");
-                } else {
-                    console.log("Added codex-switcher launcher directory to user PATH.");
-                    console.log("Open a new terminal window to use updated PATH automatically.");
-                }
-                console.log(`Path: ${result.directory}`);
-                console.log(`Launcher: ${result.launcherPath}`);
-                return 0;
-            }
-
-            if (sub === "status" || sub === "show") {
-                const result = await service.pathStatus();
-                console.log(`Directory: ${result.directory}`);
-                console.log(`Launcher: ${result.launcherPath}`);
-                console.log(result.launcherExists ? "Launcher status: present" : "Launcher status: missing");
-                console.log(result.present ? "Status: present in user PATH" : "Status: not found in user PATH");
-                return result.present && result.launcherExists ? 0 : 1;
-            }
-
-            throw new CodexSwitcherError("Usage: path <add|status>");
-        }
         default:
             throw new CodexSwitcherError(`Unknown command: ${args[0]}`);
     }
@@ -1778,7 +1695,6 @@ type MenuAction =
     | "switch-main"
     | "status"
     | "usage"
-    | "path"
     | "remove"
     | "help"
     | "quit";
@@ -1794,7 +1710,6 @@ const MENU_ITEMS: MenuItem[] = [
     { id: "switch-main", label: "Switch main profile account" },
     { id: "status", label: "Check status (all profiles)" },
     { id: "usage", label: "Show usage by model (all profiles)" },
-    { id: "path", label: "Add codex-switcher to PATH" },
     { id: "remove", label: "Remove profile" },
     { id: "help", label: "Show help" },
     { id: "quit", label: "Exit" },
@@ -1995,21 +1910,6 @@ function InteractiveApp(props: { service: CodexService }): React.JSX.Element {
                     setViewState({
                         mode: "message",
                         lines: [...profiles.map((item) => `- ${item.name} (${item.homeDirectory})`), "Press any key to return."],
-                    });
-                }
-            }
-
-            if (action === "path") {
-                const result = await props.service.pathAdd();
-                if (result.status === "already") {
-                    setViewState({
-                        mode: "message",
-                        lines: ["Already present in user PATH.", `Path: ${result.directory}`, `Launcher: ${result.launcherPath}`, "Press any key to return."],
-                    });
-                } else {
-                    setViewState({
-                        mode: "message",
-                        lines: ["Added to user PATH.", `Path: ${result.directory}`, `Launcher: ${result.launcherPath}`, "Open a new terminal window.", "Press any key to return."],
                     });
                 }
             }

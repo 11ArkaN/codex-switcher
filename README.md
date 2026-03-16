@@ -92,26 +92,6 @@ node dist/index.js usage main --period month
 On startup, if `main` is missing, the app checks default `CODEX_HOME` (`%USERPROFILE%\.codex` unless `CODEX_HOME` is already set).
 If that location is already logged in, it auto-registers as profile `main`.
 
-## Add to PATH automatically
-
-After building, run:
-
-```powershell
-node dist/index.js path add
-```
-
-This adds the project launcher directory to **user PATH** on Windows.
-
-It also creates a launcher at:
-
-- `%APPDATA%\CodexSwitcher\bin\codex-switcher.cmd`
-
-Then in a new terminal you can use:
-
-```powershell
-codex-switcher
-```
-
 ## Data locations
 
 - Profile definitions: `%APPDATA%\CodexSwitcher\profiles.json`
