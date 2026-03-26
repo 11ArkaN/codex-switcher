@@ -1072,10 +1072,15 @@ function parsePricingFromHtml(html: string): Map<string, ModelPricing> {
 
 function parsePricingFromAstroProps(html: string): Map<string, ModelPricing> {
     const pricing = new Map<string, ModelPricing>();
-    const propsRegex = /component-export="TextTokenPricingTables"[^>]*props="([^"]+)"/g;
+    const propsRegex = /component-export="([^"]+)"[^>]*props="([^"]+)"/g;
 
     for (const match of html.matchAll(propsRegex)) {
-        const decodedProps = decodeHtmlEntities(match[1] ?? "");
+        const componentExport = match[1] ?? "";
+        if (componentExport !== "TextTokenPricingTables" && componentExport !== "GroupedPricingTable") {
+            continue;
+        }
+
+        const decodedProps = decodeHtmlEntities(match[2] ?? "");
         if (decodedProps.length === 0) {
             continue;
         }
@@ -1087,29 +1092,181 @@ function parsePricingFromAstroProps(html: string): Map<string, ModelPricing> {
             continue;
         }
 
-        const props = reviveAstroSerializedValue(rawProps) as { tier?: unknown; rows?: unknown };
-        if (props.tier !== "standard" || !Array.isArray(props.rows)) {
-            continue;
-        }
-
-        for (const row of props.rows) {
-            if (!Array.isArray(row) || row.length < 4) {
+        if (componentExport === "TextTokenPricingTables") {
+            const props = reviveAstroSerializedValue(rawProps) as { tier?: unknown; rows?: unknown };
+            if (props.tier !== "standard" || !Array.isArray(props.rows)) {
                 continue;
             }
 
-            const model = normalizeModelId(String(row[0] ?? ""));
-            const inputPer1M = toFiniteNumber(row[1]);
-            const cachedInputPer1M = toFiniteNumber(row[2]);
-            const outputPer1M = toFiniteNumber(row[3]);
-            if (model.length === 0 || inputPer1M === null || outputPer1M === null) {
+            for (const row of props.rows) {
+                if (!Array.isArray(row) || row.length < 4) {
+                    continue;
+                }
+
+                const model = normalizeModelId(String(row[0] ?? ""));
+                const inputPer1M = toFiniteNumber(row[1]);
+                const cachedInputPer1M = toFiniteNumber(row[2]);
+                const outputPer1M = toFiniteNumber(row[3]);
+                if (model.length === 0 || inputPer1M === null || outputPer1M === null) {
+                    continue;
+                }
+
+                setPricingIfMissing(pricing, model, inputPer1M, cachedInputPer1M, outputPer1M);
+            }
+
+            continue;
+        }
+
+        const props = reviveAstroSerializedValue(rawProps) as { headings?: unknown; groups?: unknown };
+        const matchIndex = match.index ?? 0;
+        const paneTier = detectPricingPaneTier(html, matchIndex);
+        if (paneTier !== null && paneTier !== "standard") {
+            continue;
+        }
+
+        parseGroupedPricingTableProps(props, pricing);
+    }
+
+    return pricing;
+}
+
+function detectPricingPaneTier(html: string, componentIndex: number): string | null {
+    const lookbackStart = Math.max(0, componentIndex - 1200);
+    const lookback = html.slice(lookbackStart, componentIndex);
+    const paneRegex = /data-content-switcher-pane="true"\s+data-value="([^"]+)"/g;
+
+    let paneMatch: RegExpExecArray | null;
+    let lastPaneValue: string | null = null;
+    while ((paneMatch = paneRegex.exec(lookback)) !== null) {
+        const candidate = paneMatch[1]?.trim().toLowerCase();
+        if (candidate) {
+            lastPaneValue = candidate;
+        }
+    }
+
+    return lastPaneValue;
+}
+
+function parseGroupedPricingTableProps(
+    props: { headings?: unknown; groups?: unknown },
+    pricing: Map<string, ModelPricing>,
+): void {
+    if (!Array.isArray(props.headings) || !Array.isArray(props.groups)) {
+        return;
+    }
+
+    const headingLabels = props.headings.map((item) => extractPricingHeadingLabel(item));
+    const modelHeadingIndex = headingLabels.findIndex((label) => label === "model");
+    const inputHeadingIndex = headingLabels.findIndex((label) => label.includes("input") && !label.includes("cached"));
+    const cachedHeadingIndex = headingLabels.findIndex((label) => label.includes("cached"));
+    const outputHeadingIndex = headingLabels.findIndex((label) => label.includes("output"));
+
+    if (modelHeadingIndex < 0 || inputHeadingIndex < 0 || outputHeadingIndex < 0) {
+        return;
+    }
+
+    for (const group of props.groups) {
+        if (!group || typeof group !== "object") {
+            continue;
+        }
+
+        const groupObject = group as { model?: unknown; rows?: unknown };
+        const groupModel = typeof groupObject.model === "string" ? groupObject.model : "";
+        if (!Array.isArray(groupObject.rows)) {
+            continue;
+        }
+
+        for (const rowEntry of groupObject.rows) {
+            if (!Array.isArray(rowEntry)) {
+                continue;
+            }
+
+            const row = rowEntry as unknown[];
+            const headingOffset = groupModel.length > 0 && row.length === headingLabels.length - 1 ? 1 : 0;
+
+            const modelValue = resolveGroupedPricingCell(row, groupModel, modelHeadingIndex, headingOffset);
+            const model = normalizeModelId(String(modelValue ?? ""));
+            if (model.length === 0) {
+                continue;
+            }
+
+            const inputPer1M = toPricingNumber(resolveGroupedPricingCell(row, groupModel, inputHeadingIndex, headingOffset));
+            const outputPer1M = toPricingNumber(resolveGroupedPricingCell(row, groupModel, outputHeadingIndex, headingOffset));
+            const cachedInputPer1M = cachedHeadingIndex >= 0
+                ? toPricingNumberOrNull(resolveGroupedPricingCell(row, groupModel, cachedHeadingIndex, headingOffset))
+                : null;
+
+            if (inputPer1M === null || outputPer1M === null) {
                 continue;
             }
 
             setPricingIfMissing(pricing, model, inputPer1M, cachedInputPer1M, outputPer1M);
         }
     }
+}
 
-    return pricing;
+function extractPricingHeadingLabel(value: unknown): string {
+    if (typeof value === "string") {
+        return value.trim().toLowerCase();
+    }
+
+    if (!value || typeof value !== "object") {
+        return "";
+    }
+
+    const objectValue = value as Record<string, unknown>;
+    const tooltipHeading = objectValue.__pricingTooltipHeading;
+    if (tooltipHeading && typeof tooltipHeading === "object") {
+        const label = (tooltipHeading as Record<string, unknown>).label;
+        if (typeof label === "string") {
+            return label.trim().toLowerCase();
+        }
+    }
+
+    const label = objectValue.label;
+    if (typeof label === "string") {
+        return label.trim().toLowerCase();
+    }
+
+    return "";
+}
+
+function resolveGroupedPricingCell(
+    row: unknown[],
+    groupModel: string,
+    headingIndex: number,
+    headingOffset: number,
+): unknown {
+    if (headingOffset === 1 && headingIndex === 0) {
+        return groupModel;
+    }
+
+    const rowIndex = headingIndex - headingOffset;
+    if (rowIndex < 0 || rowIndex >= row.length) {
+        return undefined;
+    }
+
+    return row[rowIndex];
+}
+
+function toPricingNumber(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+
+    if (typeof value === "string") {
+        return parseDollarValue(value);
+    }
+
+    return null;
+}
+
+function toPricingNumberOrNull(value: unknown): number | null {
+    if (typeof value === "string" && value.trim() === "-") {
+        return null;
+    }
+
+    return toPricingNumber(value);
 }
 
 function setPricingIfMissing(

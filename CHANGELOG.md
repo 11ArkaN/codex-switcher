@@ -6,6 +6,13 @@ The format is based on Keep a Changelog and this project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-03-26
+
+### Fixed
+
+- Fixed pricing parsing for the current OpenAI pricing page structure by adding support for Astro `GroupedPricingTable` payloads.
+- `usage` now correctly resolves standard-tier prices for current Codex models again (including `gpt-5.3-codex`) instead of falling back to missing pricing rows.
+
 ## [2.1.4] - 2026-03-16
 
 ### Changed
