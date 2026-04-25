@@ -76,7 +76,12 @@ type ModelPricing = {
     outputPer1M: number;
 };
 
-const PRICING_URL = "https://developers.openai.com/api/docs/pricing";
+type RolloutAccumulatorState = {
+    previousTotal: TokenSnapshot;
+};
+
+const PRICING_URL = "https://models.dev/api.json";
+const PRICING_SOURCE_LABEL = "models.dev API";
 const PRICING_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 const PRICING_FAILURE_CACHE_TTL_MS = 1000 * 60 * 5;
 
@@ -495,11 +500,13 @@ class CodexService {
 
         const pricingMap = await this.getPricingMap();
 
-        const rolloutFiles = await this.collectRolloutFiles(sessionsRoot);
+        const rolloutFiles = (await this.collectRolloutFiles(sessionsRoot))
+            .sort((left, right) => compareRolloutPathsByTime(left, right, sessionsRoot));
         if (rolloutFiles.length === 0) {
             return null;
         }
 
+        const rolloutAccumulatorByThread = new Map<string, RolloutAccumulatorState>();
         const usageByModel = new Map<string, Omit<ModelUsageRow, "estimatedCostUsd">>();
         const dailyTotals = new Map<string, UsageTotals>();
         const monthlyTotals = new Map<string, UsageTotals>();
@@ -507,7 +514,9 @@ class CodexService {
 
         for (const file of rolloutFiles) {
             const content = await fs.readFile(file, "utf8");
-            const usageForFile = this.parseRolloutUsageByModel(content);
+            const threadKey = extractThreadKeyFromRolloutPath(file, sessionsRoot);
+            const accumulatorState = getOrCreateRolloutAccumulatorState(rolloutAccumulatorByThread, threadKey);
+            const usageForFile = this.parseRolloutUsageByModel(content, accumulatorState);
             if (usageForFile.size === 0) {
                 continue;
             }
@@ -595,12 +604,12 @@ class CodexService {
         };
     }
 
-    private parseRolloutUsageByModel(content: string): Map<string, TokenSnapshot> {
+    private parseRolloutUsageByModel(content: string, accumulatorState: RolloutAccumulatorState): Map<string, TokenSnapshot> {
         const usageByModel = new Map<string, TokenSnapshot>();
         const lines = content.split(/\r?\n/);
 
         let currentModel = "unknown";
-        let previousTotal = zeroTokenSnapshot();
+        let previousTotal = { ...accumulatorState.previousTotal };
 
         for (const rawLine of lines) {
             const line = rawLine.trim();
@@ -652,7 +661,7 @@ class CodexService {
 
             if (totalUsage && typeof totalUsage === "object") {
                 const currentTotal = parseTokenSnapshot(totalUsage as Record<string, unknown>);
-                delta = subtractSnapshots(currentTotal, previousTotal);
+                delta = subtractSnapshotsWithReset(currentTotal, previousTotal);
                 previousTotal = currentTotal;
             } else if (lastUsage && typeof lastUsage === "object") {
                 delta = parseTokenSnapshot(lastUsage as Record<string, unknown>);
@@ -674,6 +683,8 @@ class CodexService {
             }
         }
 
+        accumulatorState.previousTotal = previousTotal;
+
         return usageByModel;
     }
 
@@ -684,7 +695,7 @@ class CodexService {
         }
 
         try {
-            let html: string | null = null;
+            let apiPayload: unknown | null = null;
             const maxAttempts = 3;
 
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -694,7 +705,7 @@ class CodexService {
                         throw new CodexSwitcherError(`Pricing request failed with status ${response.status}.`);
                     }
 
-                    html = await response.text();
+                    apiPayload = await response.json();
                     break;
                 } catch {
                     if (attempt >= maxAttempts) {
@@ -707,11 +718,11 @@ class CodexService {
                 }
             }
 
-            if (!html) {
+            if (apiPayload === null) {
                 throw new CodexSwitcherError("Pricing request returned empty response.");
             }
 
-            const parsed = parsePricingFromHtml(html);
+            const parsed = parsePricingFromModelsDevApi(apiPayload);
             this.pricingCache = parsed;
             this.pricingCacheExpiresAt = now + (parsed.size > 0 ? PRICING_CACHE_TTL_MS : PRICING_FAILURE_CACHE_TTL_MS);
             return parsed;
@@ -1020,6 +1031,22 @@ function subtractSnapshots(current: TokenSnapshot, previous: TokenSnapshot): Tok
     };
 }
 
+function subtractSnapshotsWithReset(current: TokenSnapshot, previous: TokenSnapshot): TokenSnapshot {
+    const resetDetected = (
+        current.totalTokens < previous.totalTokens
+        || current.inputTokens < previous.inputTokens
+        || current.cachedInputTokens < previous.cachedInputTokens
+        || current.outputTokens < previous.outputTokens
+        || current.reasoningOutputTokens < previous.reasoningOutputTokens
+    );
+
+    if (resetDetected) {
+        return { ...current };
+    }
+
+    return subtractSnapshots(current, previous);
+}
+
 function isZeroSnapshot(value: TokenSnapshot): boolean {
     return (
         value.inputTokens === 0
@@ -1045,6 +1072,109 @@ function normalizeModelId(model: string): string {
     }
 
     return trimmed;
+}
+
+function parsePricingFromModelsDevApi(payload: unknown): Map<string, ModelPricing> {
+    const pricingCandidates = new Map<string, { priority: number; pricing: ModelPricing }>();
+    const visited = new Set<object>();
+
+    const getPricingPriority = (modelId: string): number => {
+        const normalizedModelId = modelId.trim().toLowerCase();
+        if (normalizedModelId.startsWith("openai/")) {
+            return 3;
+        }
+
+        if (!normalizedModelId.includes("/")) {
+            return 2;
+        }
+
+        return 1;
+    };
+
+    const addPricing = (modelId: string, node: Record<string, unknown>): void => {
+        const normalizedModel = normalizeModelId(modelId);
+        if (normalizedModel.length === 0) {
+            return;
+        }
+
+        const costRaw = node.cost;
+        if (!costRaw || typeof costRaw !== "object") {
+            return;
+        }
+
+        const cost = costRaw as Record<string, unknown>;
+        const inputPer1M = toFiniteNumber(cost.input);
+        const outputPer1M = toFiniteNumber(cost.output);
+        if (inputPer1M === null || outputPer1M === null) {
+            return;
+        }
+
+        const cachedInputPer1M = toFiniteNumber(cost.cache_read);
+        const candidate = {
+            pricing: {
+                inputPer1M,
+                cachedInputPer1M,
+                outputPer1M,
+            },
+            priority: getPricingPriority(modelId),
+        };
+
+        const existing = pricingCandidates.get(normalizedModel);
+        if (!existing || candidate.priority > existing.priority) {
+            pricingCandidates.set(normalizedModel, candidate);
+        }
+    };
+
+    const walk = (node: unknown, keyHint = ""): void => {
+        if (!node || typeof node !== "object") {
+            return;
+        }
+
+        const objectNode = node as Record<string, unknown>;
+        if (visited.has(objectNode)) {
+            return;
+        }
+
+        visited.add(objectNode);
+
+        const modelIdFromNode = typeof objectNode.id === "string" ? objectNode.id : keyHint;
+        if (modelIdFromNode.length > 0) {
+            addPricing(modelIdFromNode, objectNode);
+        }
+
+        const modelsNode = objectNode.models;
+        if (modelsNode && typeof modelsNode === "object") {
+            const modelsRecord = modelsNode as Record<string, unknown>;
+            for (const [modelKey, modelValue] of Object.entries(modelsRecord)) {
+                if (!modelValue || typeof modelValue !== "object") {
+                    continue;
+                }
+
+                const modelObject = modelValue as Record<string, unknown>;
+                const modelId = typeof modelObject.id === "string" ? modelObject.id : modelKey;
+                addPricing(modelId, modelObject);
+                walk(modelObject, modelId);
+            }
+        }
+
+        for (const [childKey, childValue] of Object.entries(objectNode)) {
+            if (childKey === "models") {
+                continue;
+            }
+
+            if (childValue && typeof childValue === "object") {
+                walk(childValue, childKey);
+            }
+        }
+    };
+
+    walk(payload);
+    const pricing = new Map<string, ModelPricing>();
+    for (const [model, candidate] of pricingCandidates.entries()) {
+        pricing.set(model, candidate.pricing);
+    }
+
+    return pricing;
 }
 
 function parsePricingFromHtml(html: string): Map<string, ModelPricing> {
@@ -1433,6 +1563,51 @@ function mapPeriodTotalsToRows(periodMap: Map<string, UsageTotals>): TimeCostRow
         .sort((left, right) => right.period.localeCompare(left.period));
 }
 
+function getOrCreateRolloutAccumulatorState(
+    map: Map<string, RolloutAccumulatorState>,
+    threadKey: string,
+): RolloutAccumulatorState {
+    const existing = map.get(threadKey);
+    if (existing) {
+        return existing;
+    }
+
+    const created: RolloutAccumulatorState = {
+        previousTotal: zeroTokenSnapshot(),
+    };
+    map.set(threadKey, created);
+    return created;
+}
+
+function compareRolloutPathsByTime(leftPath: string, rightPath: string, sessionsRoot: string): number {
+    const leftRelative = path.relative(sessionsRoot, leftPath).replace(/\\/g, "/");
+    const rightRelative = path.relative(sessionsRoot, rightPath).replace(/\\/g, "/");
+    return leftRelative.localeCompare(rightRelative);
+}
+
+function extractThreadKeyFromRolloutPath(filePath: string, sessionsRoot: string): string {
+    const relative = path.relative(sessionsRoot, filePath).replace(/\\/g, "/");
+    const segments = relative.split("/").filter((item) => item.length > 0);
+
+    if (segments.length <= 3) {
+        return relative;
+    }
+
+    const withoutDate = segments.slice(3);
+    if (withoutDate.length <= 1) {
+        const onlyPart = withoutDate[0] ?? relative;
+        return onlyPart.replace(/^rollout-/, "").replace(/\.jsonl$/i, "");
+    }
+
+    const threadDirectories = withoutDate.slice(0, -1);
+    if (threadDirectories.length > 0) {
+        return threadDirectories.join("/");
+    }
+
+    const fileName = withoutDate[withoutDate.length - 1] ?? relative;
+    return fileName.replace(/^rollout-/, "").replace(/\.jsonl$/i, "");
+}
+
 function extractPeriodsFromRolloutPath(filePath: string, sessionsRoot: string): { day: string; month: string } {
     const relative = path.relative(sessionsRoot, filePath).replace(/\\/g, "/");
     const match = relative.match(/^(\d{4})\/(\d{2})\/(\d{2})\//);
@@ -1489,7 +1664,7 @@ function buildModelUsageLines(usageByProfile: ProfileUsage[]): string[] {
     lines.push(
         `Grand total: input ${formatNumber(globalTotals.inputTokens)}, cached ${formatNumber(globalTotals.cachedInputTokens)}, output ${formatNumber(globalTotals.outputTokens)}, total ${formatNumber(globalTotals.totalTokens)}, threads ${globalTotals.threadCount}, cost ${formatUsd(globalTotals.estimatedCostUsd)}${globalTotals.unknownPricingRows > 0 ? ` (${globalTotals.unknownPricingRows} model row(s) without pricing)` : ""}`,
     );
-    lines.push(`Pricing source: ${PRICING_URL} (standard tier).`);
+    lines.push(`Pricing source: ${PRICING_SOURCE_LABEL} (${PRICING_URL}).`);
 
     return lines;
 }
@@ -1532,7 +1707,7 @@ function buildPeriodUsageLines(usageByProfile: ProfileUsage[], granularity: Peri
     lines.push(
         `Grand ${granularity} total: input ${formatNumber(globalTotals.inputTokens)}, cached ${formatNumber(globalTotals.cachedInputTokens)}, output ${formatNumber(globalTotals.outputTokens)}, total ${formatNumber(globalTotals.totalTokens)}, threads ${globalTotals.threadCount}, cost ${formatUsd(globalTotals.estimatedCostUsd)}${globalTotals.unknownPricingRows > 0 ? ` (${globalTotals.unknownPricingRows} row(s) without pricing)` : ""}`,
     );
-    lines.push(`Pricing source: ${PRICING_URL} (standard tier).`);
+    lines.push(`Pricing source: ${PRICING_SOURCE_LABEL} (${PRICING_URL}).`);
 
     return lines;
 }

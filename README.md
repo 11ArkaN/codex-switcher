@@ -123,7 +123,7 @@ npm run release:check
 - Multiple Codex sessions are supported simultaneously via `--new-window` / `spawn`.
 - Profile storage is lock-protected to avoid concurrent write corruption.
 - `usage` shows rows per model with `input`, `cached input`, `output`, `total` tokens, `thread count`, and estimated USD cost.
-- Cost uses standard API text-token pricing fetched at runtime from OpenAI docs: [Pricing](https://developers.openai.com/api/docs/pricing).
+- Cost uses live model pricing fetched at runtime from `models.dev` API: [https://models.dev/api.json](https://models.dev/api.json).
 - Pricing is cached locally in-memory (success: 6h, fetch failure: 5m retry window).
 - If a model is missing from the local pricing map, its row is still shown but cost is `n/a`.
 - In interactive mode, profile creation uses typing; login/open/remove now use selectable profile lists.
