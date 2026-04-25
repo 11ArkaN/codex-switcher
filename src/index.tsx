@@ -80,6 +80,17 @@ type RolloutAccumulatorState = {
     previousTotal: TokenSnapshot;
 };
 
+type UsageDeltaEvent = {
+    timestamp: string | null;
+    model: string;
+    usage: TokenSnapshot;
+};
+
+type RolloutUsageParseResult = {
+    usageByModel: Map<string, TokenSnapshot>;
+    events: UsageDeltaEvent[];
+};
+
 const PRICING_URL = "https://models.dev/api.json";
 const PRICING_SOURCE_LABEL = "models.dev API";
 const PRICING_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
@@ -510,38 +521,50 @@ class CodexService {
         const usageByModel = new Map<string, Omit<ModelUsageRow, "estimatedCostUsd">>();
         const dailyTotals = new Map<string, UsageTotals>();
         const monthlyTotals = new Map<string, UsageTotals>();
+        const dailyThreadKeys = new Map<string, Set<string>>();
+        const monthlyThreadKeys = new Map<string, Set<string>>();
+        const dailyUnknownPricingModels = new Map<string, Set<string>>();
+        const monthlyUnknownPricingModels = new Map<string, Set<string>>();
         let threadsWithUsage = 0;
 
         for (const file of rolloutFiles) {
             const content = await fs.readFile(file, "utf8");
             const threadKey = extractThreadKeyFromRolloutPath(file, sessionsRoot);
             const accumulatorState = getOrCreateRolloutAccumulatorState(rolloutAccumulatorByThread, threadKey);
-            const usageForFile = this.parseRolloutUsageByModel(content, accumulatorState);
-            if (usageForFile.size === 0) {
+            const parsedUsage = this.parseRolloutUsage(content, accumulatorState);
+            if (parsedUsage.usageByModel.size === 0) {
                 continue;
             }
 
             threadsWithUsage += 1;
-            const periods = extractPeriodsFromRolloutPath(file, sessionsRoot);
-            const dayTotals = getOrCreatePeriodTotals(dailyTotals, periods.day);
-            const monthTotals = getOrCreatePeriodTotals(monthlyTotals, periods.month);
-            dayTotals.threadCount += 1;
-            monthTotals.threadCount += 1;
 
-            for (const [model, usage] of usageForFile) {
+            for (const event of parsedUsage.events) {
+                const periods = event.timestamp
+                    ? extractPeriodsFromTimestamp(event.timestamp) ?? extractPeriodsFromRolloutPath(file, sessionsRoot)
+                    : extractPeriodsFromRolloutPath(file, sessionsRoot);
+                const dayTotals = getOrCreatePeriodTotals(dailyTotals, periods.day);
+                const monthTotals = getOrCreatePeriodTotals(monthlyTotals, periods.month);
                 const modelCost = estimateCostUsd(
                     {
-                        model,
-                        inputTokens: usage.inputTokens,
-                        cachedInputTokens: usage.cachedInputTokens,
-                        outputTokens: usage.outputTokens,
+                        model: event.model,
+                        inputTokens: event.usage.inputTokens,
+                        cachedInputTokens: event.usage.cachedInputTokens,
+                        outputTokens: event.usage.outputTokens,
                     },
                     pricingMap,
                 );
 
-                addSnapshotToTotals(dayTotals, usage, modelCost);
-                addSnapshotToTotals(monthTotals, usage, modelCost);
+                addSnapshotToTotals(dayTotals, event.usage, modelCost);
+                addSnapshotToTotals(monthTotals, event.usage, modelCost);
+                addThreadKeyToPeriod(dailyThreadKeys, periods.day, threadKey);
+                addThreadKeyToPeriod(monthlyThreadKeys, periods.month, threadKey);
+                if (modelCost === null) {
+                    addUnknownPricingModelToPeriod(dailyUnknownPricingModels, periods.day, event.model);
+                    addUnknownPricingModelToPeriod(monthlyUnknownPricingModels, periods.month, event.model);
+                }
+            }
 
+            for (const [model, usage] of parsedUsage.usageByModel) {
                 const existing = usageByModel.get(model);
                 if (existing) {
                     existing.inputTokens += usage.inputTokens;
@@ -591,6 +614,10 @@ class CodexService {
         }, zeroUsageTotals());
 
         totals.threadCount = threadsWithUsage;
+        applyPeriodThreadCounts(dailyTotals, dailyThreadKeys);
+        applyPeriodThreadCounts(monthlyTotals, monthlyThreadKeys);
+        applyPeriodUnknownPricingCounts(dailyTotals, dailyUnknownPricingModels);
+        applyPeriodUnknownPricingCounts(monthlyTotals, monthlyUnknownPricingModels);
 
         const dailyCosts = mapPeriodTotalsToRows(dailyTotals);
         const monthlyCosts = mapPeriodTotalsToRows(monthlyTotals);
@@ -604,12 +631,16 @@ class CodexService {
         };
     }
 
-    private parseRolloutUsageByModel(content: string, accumulatorState: RolloutAccumulatorState): Map<string, TokenSnapshot> {
+    private parseRolloutUsage(content: string, accumulatorState: RolloutAccumulatorState): RolloutUsageParseResult {
         const usageByModel = new Map<string, TokenSnapshot>();
+        const events: UsageDeltaEvent[] = [];
         const lines = content.split(/\r?\n/);
 
         let currentModel = "unknown";
         let previousTotal = { ...accumulatorState.previousTotal };
+        let currentSessionId: string | null = null;
+        let isForkedSession = false;
+        let isInsideCurrentSessionTurn = true;
 
         for (const rawLine of lines) {
             const line = rawLine.trim();
@@ -618,16 +649,52 @@ class CodexService {
             }
 
             let parsed: {
+                timestamp?: string;
                 type?: string;
                 payload?: Record<string, unknown>;
             };
 
             try {
                 parsed = JSON.parse(line) as {
+                    timestamp?: string;
                     type?: string;
                     payload?: Record<string, unknown>;
                 };
             } catch {
+                continue;
+            }
+
+            if (parsed.type === "session_meta") {
+                if (!currentSessionId) {
+                    const sessionId = parsed.payload?.id;
+                    currentSessionId = typeof sessionId === "string" ? sessionId : null;
+                    isForkedSession = typeof parsed.payload?.forked_from_id === "string";
+                    isInsideCurrentSessionTurn = !isForkedSession;
+                }
+                continue;
+            }
+
+            if (isForkedSession && !isInsideCurrentSessionTurn) {
+                if (parsed.type === "event_msg") {
+                    const payloadType = parsed.payload?.type;
+                    const turnId = parsed.payload?.turn_id;
+                    if (
+                        payloadType === "task_started"
+                        && typeof turnId === "string"
+                        && currentSessionId
+                        && isTurnIdFromSession(turnId, currentSessionId)
+                    ) {
+                        isInsideCurrentSessionTurn = true;
+                    } else if (payloadType === "token_count") {
+                        const info = parsed.payload?.info;
+                        const totalUsage = info && typeof info === "object"
+                            ? (info as Record<string, unknown>).total_token_usage
+                            : null;
+                        if (totalUsage && typeof totalUsage === "object") {
+                            previousTotal = parseTokenSnapshot(totalUsage as Record<string, unknown>);
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -671,6 +738,12 @@ class CodexService {
                 continue;
             }
 
+            events.push({
+                timestamp: typeof parsed.timestamp === "string" ? parsed.timestamp : null,
+                model: currentModel,
+                usage: { ...delta },
+            });
+
             const modelUsage = usageByModel.get(currentModel);
             if (modelUsage) {
                 modelUsage.inputTokens += delta.inputTokens;
@@ -685,7 +758,7 @@ class CodexService {
 
         accumulatorState.previousTotal = previousTotal;
 
-        return usageByModel;
+        return { usageByModel, events };
     }
 
     private async getPricingMap(): Promise<Map<string, ModelPricing>> {
@@ -1514,9 +1587,11 @@ function estimateCostUsd(
         return null;
     }
 
+    const cachedInputTokens = Math.min(row.cachedInputTokens, row.inputTokens);
+    const uncachedInputTokens = Math.max(row.inputTokens - cachedInputTokens, 0);
     const cachedRate = pricing.cachedInputPer1M ?? pricing.inputPer1M;
-    const inputCost = (row.inputTokens / 1_000_000) * pricing.inputPer1M;
-    const cachedCost = (row.cachedInputTokens / 1_000_000) * cachedRate;
+    const inputCost = (uncachedInputTokens / 1_000_000) * pricing.inputPer1M;
+    const cachedCost = (cachedInputTokens / 1_000_000) * cachedRate;
     const outputCost = (row.outputTokens / 1_000_000) * pricing.outputPer1M;
 
     return inputCost + cachedCost + outputCost;
@@ -1531,6 +1606,41 @@ function getOrCreatePeriodTotals(map: Map<string, UsageTotals>, period: string):
     const created = zeroUsageTotals();
     map.set(period, created);
     return created;
+}
+
+function addThreadKeyToPeriod(map: Map<string, Set<string>>, period: string, threadKey: string): void {
+    const existing = map.get(period);
+    if (existing) {
+        existing.add(threadKey);
+        return;
+    }
+
+    map.set(period, new Set([threadKey]));
+}
+
+function applyPeriodThreadCounts(periodTotals: Map<string, UsageTotals>, periodThreadKeys: Map<string, Set<string>>): void {
+    for (const [period, totals] of periodTotals) {
+        totals.threadCount = periodThreadKeys.get(period)?.size ?? 0;
+    }
+}
+
+function addUnknownPricingModelToPeriod(map: Map<string, Set<string>>, period: string, model: string): void {
+    const existing = map.get(period);
+    if (existing) {
+        existing.add(model);
+        return;
+    }
+
+    map.set(period, new Set([model]));
+}
+
+function applyPeriodUnknownPricingCounts(
+    periodTotals: Map<string, UsageTotals>,
+    periodUnknownPricingModels: Map<string, Set<string>>,
+): void {
+    for (const [period, totals] of periodTotals) {
+        totals.unknownPricingRows = periodUnknownPricingModels.get(period)?.size ?? 0;
+    }
 }
 
 function addSnapshotToTotals(totals: UsageTotals, usage: TokenSnapshot, estimatedCostUsd: number | null): void {
@@ -1585,6 +1695,11 @@ function compareRolloutPathsByTime(leftPath: string, rightPath: string, sessions
     return leftRelative.localeCompare(rightRelative);
 }
 
+function isTurnIdFromSession(turnId: string, sessionId: string): boolean {
+    const sessionPrefix = sessionId.split("-")[0];
+    return sessionPrefix ? turnId.startsWith(sessionPrefix) : turnId.startsWith(sessionId);
+}
+
 function extractThreadKeyFromRolloutPath(filePath: string, sessionsRoot: string): string {
     const relative = path.relative(sessionsRoot, filePath).replace(/\\/g, "/");
     const segments = relative.split("/").filter((item) => item.length > 0);
@@ -1613,6 +1728,19 @@ function extractPeriodsFromRolloutPath(filePath: string, sessionsRoot: string): 
     const match = relative.match(/^(\d{4})\/(\d{2})\/(\d{2})\//);
     if (!match) {
         return { day: "unknown", month: "unknown" };
+    }
+
+    const [, year, month, day] = match;
+    return {
+        day: `${year}-${month}-${day}`,
+        month: `${year}-${month}`,
+    };
+}
+
+function extractPeriodsFromTimestamp(timestamp: string): { day: string; month: string } | null {
+    const match = timestamp.match(/^(\d{4})-(\d{2})-(\d{2})T/);
+    if (!match) {
+        return null;
     }
 
     const [, year, month, day] = match;
